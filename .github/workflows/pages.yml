@@ -13,7 +13,7 @@ concurrency:
 jobs:
   test:
     name: Validate bridge and PWA
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,6 +32,7 @@ jobs:
         with:
           name: browser-screenshots
           path: .work/*.png
+          include-hidden-files: true
       - name: Run tests
         run: python -m unittest discover -s tests -v
       - name: Stage static Pages site
@@ -48,7 +49,7 @@ jobs:
     name: Publish website
     if: github.event_name != 'pull_request'
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pages: write
       id-token: write
