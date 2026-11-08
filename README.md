@@ -33,3 +33,9 @@ python -m unittest discover -s tests -v
 ```
 
 Tests use Python's standard library and optionally Node.js for JavaScript syntax verification.
+
+## New sessions and the Android sidebar
+
+Creating a new session in the Android app automatically selects it, adds it to the top of the session list, and closes the mobile drawer. Use the × button, backdrop, or Escape key to close the drawer at any time.
+
+**After upgrading:** refresh or reopen the installed PWA (the service worker cache was bumped to v2) and replace/restart the Windows `bridge/opencode_bt_bridge.py`. The existing COM3 BAT launcher remains compatible. An older running bridge may still report stale sessions even when the web UI is updated.

@@ -19,6 +19,20 @@ class SiteTests(unittest.TestCase):
         self.assertIn('href="./manifest.webmanifest"',html)
         self.assertIn("worker-src 'self'",html)
         self.assertNotIn('One-time bridge token',html)
+    def test_mobile_sidebar_closes_and_new_session_is_handled(self):
+        html=(ROOT/"index.html").read_text()
+        self.assertIn('id="sidebarScrim"',html)
+        self.assertIn('id="closeSidebarBtn"',html)
+        self.assertIn('aria-controls="sidebar"',html)
+        self.assertIn("function setSidebarOpen(open)",html)
+        self.assertIn("$('closeSidebarBtn').onclick=closeSidebar",html)
+        self.assertIn("$('sidebarScrim').onclick=closeSidebar",html)
+        self.assertIn("if(e.key==='Escape')closeSidebar()",html)
+        self.assertIn("await send('/new');closeSidebar()",html)
+        self.assertIn("renderSessions();closeSidebar();showEmpty",html)
+        self.assertIn(".sidebar-scrim.open{display:block}",html)
+        self.assertIn("serialopencode-pwa-v2",(ROOT/"sw.js").read_text())
+
     def test_manifest_and_assets(self):
         m=json.loads((ROOT/"manifest.webmanifest").read_text())
         self.assertEqual(m["start_url"],"./index.html")

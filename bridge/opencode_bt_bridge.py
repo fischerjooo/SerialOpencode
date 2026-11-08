@@ -141,11 +141,21 @@ class BluetoothBridge:
         sessions = self.api.request("GET", "/session")
         if not isinstance(sessions, list):
             raise APIError(f"Unexpected /session response: {type(sessions).__name__}")
-        self.sessions = sorted(
+        latest = sorted(
             (s for s in sessions if isinstance(s, dict) and isinstance(s.get("id"), str)),
             key=timestamp,
             reverse=True,
-        )[:SESSION_LIST_LIMIT]
+        )
+        # Newly created sessions may not be returned by /session immediately.
+        # Keep the selected session visible until the server's listing catches up.
+        active = next((s for s in self.sessions if s["id"] == self.session_id), None)
+        if active and not any(s["id"] == self.session_id for s in latest):
+            latest.insert(0, active)
+        self.sessions = latest[:SESSION_LIST_LIMIT]
+        self.send_sessions()
+
+    def send_sessions(self) -> None:
+        """Send the current numbered list, without querying the server again."""
         if not self.sessions:
             if self.ui_json:
                 self.send_event("sessions", {"items": []})
@@ -208,14 +218,19 @@ class BluetoothBridge:
         if not isinstance(session, dict) or not isinstance(session.get("id"), str):
             raise APIError("Unexpected /session create response")
         self.session_id = session["id"]
+        # Include the session in the list *before* emitting events; we must not
+        # depend on /session returning the newly created item right away.
+        self.sessions = ([session] + [s for s in self.sessions if s["id"] != self.session_id])[:SESSION_LIST_LIMIT]
         self.seen.clear()
         self.last_poll_time = time.monotonic()
         if self.ui_json:
             self.send_event("selected", {"id": self.session_id, "title": session.get("title") or "Untitled"})
+            self.send_sessions()
             self.send_event("history_begin")
             self.send_event("history_end")
         else:
-            self.send(f"New session created: {session.get('title') or 'Untitled'}")
+            self.send(f"Selected: {session.get('title') or 'Untitled'}")
+            self.send_sessions()
             self.send("Send any text to start chatting.")
 
     def fetch_messages(self) -> list[dict[str, Any]]:
