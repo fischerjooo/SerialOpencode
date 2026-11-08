@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
-"""OpenCode 1.x <-> Android Bluetooth SPP text bridge for Windows.
+"""OpenCode 1.x Bluetooth remote bridge. Paired devices are trusted.
 
-Requirements: Python 3.9+ and pyserial.  No Wi-Fi or network port is opened
-by this bridge: it connects to OpenCode on 127.0.0.1 and to an existing Windows
-incoming Bluetooth serial COM port.
-
-Android client: Serial Bluetooth Terminal (Bluetooth Classic SPP, LF line ending).
-
-This is a minimal text-chat bridge, not a fully featured OpenCode client.
-Bluetooth SPP pairing is used; no extra bridge authentication code is required.
-It deliberately does not expose tool permissions, shell commands, or server
-configuration. Only use where permitted by your organization's policies.
+No network listener is opened. Optional existing OpenCode server credentials
+are read from the environment; the default is password-free loopback IPC.
+Version 3 adds acknowledged JSON commands while retaining terminal commands.
 """
 
 from __future__ import annotations
 
+from remote import RemoteCommands
 import argparse
 import base64
-import getpass
 import json
 import os
 import sys
@@ -34,9 +27,9 @@ except ImportError:
     sys.exit(2)
 
 
-MAX_INPUT_BYTES = 8192
+MAX_INPUT_BYTES = 32768
 MAX_MESSAGE_CHARACTERS = 12000
-SESSION_LIST_LIMIT = 10
+SESSION_LIST_LIMIT = 100
 
 
 class APIError(RuntimeError):
@@ -44,30 +37,34 @@ class APIError(RuntimeError):
 
 
 class OpenCodeAPI:
-    """Basic-auth OpenCode API client, restricted to loopback.
+    """OpenCode API client with optional Basic auth, restricted to loopback.
 
     Explicit ProxyHandler({}) is important on proxy-managed Windows PCs:
     HTTP to 127.0.0.1 is a local IPC connection, not a corporate web request.
     """
 
-    def __init__(self, port: int, password: str, username: str = "opencode") -> None:
+    def __init__(self, port: int, password: str = "", username: str = "opencode") -> None:
         self.base = f"http://127.0.0.1:{port}"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        self.authorization = f"Basic {token}"
+        self.authorization = f"Basic {token}" if password else None
 
     def request(self, method: str, path: str, payload: Any = None) -> Any:
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("API path must be an absolute local path")
         url = self.base + path
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Accept": "application/json", "Authorization": self.authorization}
+        headers = {"Accept": "application/json"}
+        if self.authorization:
+            headers["Authorization"] = self.authorization
         if data is not None:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with self.opener.open(req, timeout=8.0) as response:
-                body = response.read()
+                body = response.read(8 * 1024 * 1024 + 1)
+                if len(body) > 8 * 1024 * 1024:
+                    raise APIError("OpenCode response exceeds 8 MiB")
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as exc:
             raw = exc.read(350).decode("utf-8", errors="replace").strip()
@@ -76,7 +73,7 @@ class OpenCodeAPI:
             raise APIError(f"OpenCode HTTP {exc.code}: {raw[:200]}") from exc
         except urllib.error.URLError as exc:
             raise APIError(f"Cannot reach OpenCode at {self.base}: {exc.reason}") from exc
-        except TimeoutError as exc:
+        except (TimeoutError, OSError) as exc:
             raise APIError("OpenCode did not respond within 8 seconds") from exc
         except (ValueError, UnicodeError) as exc:
             raise APIError(f"OpenCode returned invalid JSON: {exc}") from exc
@@ -115,16 +112,48 @@ class BluetoothBridge:
         self.session_id: str | None = None
         self.seen: dict[str, str] = {}
         self.last_poll_time = 0.0
+        self.remote = RemoteCommands(self)
+        self.busy = False
+        self.discarding = False
         self.ui_json = False  # Upgraded Android app opts in with /ui json.
+
+    def write_all(self, data: bytes) -> None:
+        while data:
+            written = self.port.write(data)
+            if written is None:  # Compatibility with adapters that consume the full buffer.
+                return
+            if written <= 0:
+                raise OSError("Bluetooth write made no progress")
+            data = data[written:]
+
+    def feed(self, data: bytes) -> None:
+        """Discard oversized frames through LF, including any dangerous command tail."""
+        for byte in data:
+            if byte == 10:
+                if not self.discarding:
+                    try:
+                        self.command(self.buffer.decode("utf-8", errors="strict"))
+                    except (APIError, ValueError, UnicodeError) as exc:
+                        self.send_event("error", {"message": str(exc)}) if self.ui_json else self.send(str(exc))
+                self.buffer.clear()
+                self.discarding = False
+            elif not self.discarding:
+                self.buffer.append(byte)
+                if len(self.buffer) > MAX_INPUT_BYTES:
+                    self.buffer.clear()
+                    self.discarding = True
+                    self.send("Input too long; frame discarded through next LF.")
 
     def send_event(self, event: str, fields: dict[str, Any] | None = None) -> None:
         """One UTF-8 JSON frame per line, compatible with Android's readLine()."""
         frame = {"type": event}
         frame.update(fields or {})
+        if event in ("message", "message_delta", "history_begin", "history_end"):
+            frame["sessionId"] = self.session_id
         text = "@OCBT1 " + json.dumps(frame, ensure_ascii=False, separators=(",", ":")) + "\r\n"
         data = text.encode("utf-8")
         for start in range(0, len(data), 256):
-            self.port.write(data[start:start + 256])
+            self.write_all(data[start:start + 256])
 
     def send(self, text: str) -> None:
         """Write UTF-8 text with CRLF line endings for Android terminal apps."""
@@ -135,7 +164,7 @@ class BluetoothBridge:
         data = (text.replace("\n", "\r\n") + "\r\n").encode("utf-8", errors="replace")
         # Small blocks make it friendlier to low-throughput Bluetooth serial links.
         for start in range(0, len(data), 256):
-            self.port.write(data[start:start + 256])
+            self.write_all(data[start:start + 256])
 
     def sessions_command(self) -> None:
         sessions = self.api.request("GET", "/session")
@@ -190,6 +219,7 @@ class BluetoothBridge:
         session = self.sessions[index - 1]
         self.session_id = session["id"]
         self.seen.clear()
+        self.remote.pending = None
         if self.ui_json:
             self.send_event("selected", {"id": self.session_id, "title": session.get("title") or "Untitled"})
         else:
@@ -205,6 +235,7 @@ class BluetoothBridge:
         self.sessions = sorted(valid, key=timestamp, reverse=True)[:SESSION_LIST_LIMIT]
         self.session_id = self.sessions[0]["id"]
         self.seen.clear()
+        self.remote.pending = None
         self.last_poll_time = time.monotonic()
         title = self.sessions[0].get("title") or "Untitled"
         print(f"Auto-connected to newest session: {title} ({self.session_id})")
@@ -222,6 +253,7 @@ class BluetoothBridge:
         # depend on /session returning the newly created item right away.
         self.sessions = ([session] + [s for s in self.sessions if s["id"] != self.session_id])[:SESSION_LIST_LIMIT]
         self.seen.clear()
+        self.remote.pending = None
         self.last_poll_time = time.monotonic()
         if self.ui_json:
             self.send_event("selected", {"id": self.session_id, "title": session.get("title") or "Untitled"})
@@ -246,7 +278,7 @@ class BluetoothBridge:
         messages = self.fetch_messages()
         # Seed all currently fetched messages to prevent duplicate replay by polling.
         self.seen = {
-            str(m.get("info", {}).get("id", f"unknown-{i}")): message_text(m)
+            str((m.get("info") or {}).get("id", f"unknown-{i}")): message_text(m)
             for i, m in enumerate(messages)
         }
         shown = 0
@@ -278,7 +310,10 @@ class BluetoothBridge:
     def poll(self) -> None:
         if not self.session_id:
             return
-        for i, m in enumerate(self.fetch_messages()):
+        messages = self.fetch_messages()
+        live_ids = {str((m.get("info") or {}).get("id", f"unknown-{i}")) for i, m in enumerate(messages)}
+        self.seen = {k: v for k, v in self.seen.items() if k in live_ids}
+        for i, m in enumerate(messages):
             info = m.get("info") or {}
             role = info.get("role")
             if role not in ("user", "assistant"):
@@ -296,7 +331,7 @@ class BluetoothBridge:
             elif current != before:
                 self.seen[ident] = current
                 if self.ui_json:
-                    self.send_event("message", {"id": ident, "role": role, "text": safe_line(current)})
+                    self.send_event("message_delta", {"id": ident, "role": role, "text": current[len(before):]}) if current.startswith(before) and len(current) <= MAX_MESSAGE_CHARACTERS else self.send_event("message", {"id": ident, "role": role, "text": safe_line(current)})
                 elif current.startswith(before):
                     addition = current[len(before):]
                     if addition:
@@ -313,6 +348,7 @@ class BluetoothBridge:
             state = states.get(self.session_id, "idle/unknown") if isinstance(states, dict) else "unknown"
             if isinstance(state, dict):
                 state = state.get("type", "unknown")
+            self.busy = state == "busy"
             if self.ui_json:
                 self.send_event("status", {"id": self.session_id, "status": state})
             else:
@@ -322,12 +358,16 @@ class BluetoothBridge:
 
     def command(self, raw: str) -> None:
         line = raw.strip()
+        if line.startswith("@OCBT1 "):
+            self.ui_json = True
+            self.remote.handle(line[7:])
+            return
         if not line:
             return
 
         if line == "/ui json":
             self.ui_json = True
-            self.send_event("hello", {"version": 2, "transport": "Bluetooth RFCOMM", "auth": False})
+            self.send_event("hello", {"version": 3, "transport": "Bluetooth RFCOMM", "auth": False})
         elif line == "/ui text":
             self.ui_json = False
             self.send("Text terminal protocol enabled.")
@@ -376,23 +416,14 @@ class BluetoothBridge:
                 n = min(max(self.port.in_waiting, 1), 1024)
                 data = self.port.read(n)
                 if data:
-                    self.buffer.extend(data)
-                    if len(self.buffer) > MAX_INPUT_BYTES:
-                        self.buffer.clear()
-                        self.send("Input too long; send a shorter line ending with LF.")
-                    while b"\n" in self.buffer:
-                        line, _, leftover = self.buffer.partition(b"\n")
-                        self.buffer = bytearray(leftover)
-                        try:
-                            self.command(line.decode("utf-8", errors="replace"))
-                        except APIError as exc:
-                            self.send(f"OpenCode error: {exc}")
+                    self.feed(data)
                 now = time.monotonic()
-                if self.session_id and now - self.last_poll_time >= self.poll_interval:
+                if self.session_id and now - self.last_poll_time >= (self.poll_interval if self.busy else max(3, self.poll_interval)):
                     self.last_poll_time = now
                     try:
                         self.poll()
-                    except APIError as exc:
+                        self.remote.poll()
+                    except (APIError, ValueError) as exc:
                         print(f"OpenCode polling error: {exc}")
                         self.send(f"OpenCode connection issue: {exc}")
                         # Avoid rapidly repeating the same error on the phone.
@@ -405,14 +436,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="OpenCode 1.x Bluetooth serial chat bridge")
     parser.add_argument("--com", default="COM3", help="Windows incoming Bluetooth COM port (default COM3)")
     parser.add_argument("--api-port", type=int, default=4096, help="OpenCode loopback HTTP port (default 4096)")
-    parser.add_argument("--poll", type=float, default=2.0, help="Chat polling interval in seconds (default 2)")
+    parser.add_argument("--poll", type=float, default=0.5, help="Chat polling interval in seconds (default 0.5)")
     args = parser.parse_args()
     if not (1 <= args.api_port <= 65535 and 0.5 <= args.poll <= 60):
         parser.error("API port must be 1..65535 and poll interval 0.5..60 seconds")
-    password = os.environ.get("OPENCODE_SERVER_PASSWORD") or getpass.getpass("Password set by OPENCODE_SERVER_PASSWORD: ")
-    if not password:
-        print("A nonempty OpenCode server password is required.", file=sys.stderr)
-        return 2
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
     api = OpenCodeAPI(args.api_port, password)
     try:
         sessions = api.request("GET", "/session")

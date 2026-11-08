@@ -1,0 +1,24 @@
+{
+  "name": "serialopencode",
+  "version": "1.0.0",
+  "description": "Unofficial Bluetooth Classic (SPP/RFCOMM) web remote for OpenCode 1.x. Android Chrome connects over Web Serial to a Windows Python bridge on an incoming Bluetooth COM port. **GitHub Pages serves only the app interface; prompts and replies travel over Bluetooth, not over GitHub.**",
+  "scripts": {
+    "build": "python scripts/build_web.py",
+    "test": "node tests/browser.cjs",
+    "format": "prettier --write web/app.js web/styles.css tests/browser.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fischerjooo/SerialOpencode.git"
+  },
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/fischerjooo/SerialOpencode/issues"
+  },
+  "homepage": "https://github.com/fischerjooo/SerialOpencode#readme",
+  "devDependencies": {
+    "playwright": "1.56.1",
+    "prettier": "3.6.2"
+  },
+  "private": true
+}
