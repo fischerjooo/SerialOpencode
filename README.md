@@ -1,41 +1,60 @@
-# SerialOpencode — OpenCode 1.x over Bluetooth
+# SerialOpencode — OpenCode over Bluetooth
 
-Unofficial Bluetooth Classic (SPP/RFCOMM) web remote for OpenCode 1.x. Android Chrome connects over Web Serial to a Windows Python bridge on an incoming Bluetooth COM port. **GitHub Pages serves only the app interface; prompts and replies travel over Bluetooth, not over GitHub.**
+A standalone, installable web remote for a local OpenCode 1.x server. GitHub Pages delivers the interface; session data travels over paired Bluetooth Classic SPP / Web Serial, not through GitHub or a relay.
 
-**Website (after enabling GitHub Pages):** https://fischerjooo.github.io/SerialOpencode/
+## Start on Windows
 
-## Quick start
+1. Install OpenCode and Python 3.9+; run `py -3 -m pip install -r requirements.txt`.
+2. Pair the devices and configure a Windows **incoming Bluetooth COM port**.
+3. Keep the repository folder structure intact. Run:
 
-1. Pair Android with Windows 11 and create an **Incoming Bluetooth COM port** (default COM3). Verify that two-way serial text works.
-2. On Windows install Python 3.9+ and `py -3 -m pip install pyserial`.
-3. Copy `bridge/opencode_bt_bridge.py` and `windows/Start_OpenCode_Bluetooth.bat` into the same Windows folder. The launcher defaults to `C:\WORK\sandbox\Crypto_TestAppl_QEMU`, OpenCode server `127.0.0.1:4096`, and incoming `COM3`; edit if your machine differs.
-4. Run the BAT, enter the same OpenCode API password in the server, bridge and terminal windows. No *additional one-time bridge token* is required.
-5. Open **https://fischerjooo.github.io/SerialOpencode/** in Android Chrome 138+, select **Add to Home screen / Install app**, launch it, then tap **Connect BT** and authorize the paired laptop.
+   ```bat
+   windows\Start_OpenCode_Bluetooth.bat --project "C:\path\to\your\project" --com COM3
+   ```
 
-You can view and select sessions, read messages, send prompts, and see replies. Tool approvals and full interactive terminal access are not supported.
+4. Open https://fischerjooo.github.io/SerialOpencode/ in a browser supporting Bluetooth Web Serial. Tap **Connect BT** and choose the paired device. Browser/platform support varies; the app reports missing Web Serial. Install via the browser's home-screen menu if available.
 
-## Automatic website deployment
+The launcher starts the server on `127.0.0.1:4096` and the bridge hidden. The initial BAT console closes after startup. It does **not** open an interactive OpenCode terminal. To attach manually, run `opencode attach http://127.0.0.1:4096`.
 
-`.github/workflows/pages.yml` tests the Python bridge and the web app, then publishes the app on every push to `main`.
+Defaults: project = repository root, COM3, API port 4096. Override with `--project`, `--com`, `--api-port`. A lock prevents duplicate supervisors for the same COM port. An already healthy OpenCode server is reused; its existing project context remains in effect. Use another API port for another project.
 
-**Required one-time setup:** In GitHub go to **Settings → Pages → Build and deployment → Source → GitHub Actions**. This setting cannot be enabled using a workflow's default `GITHUB_TOKEN`. After enabling, rerun the workflow from **Actions** or push a new commit.
+Stop with `windows\Stop_OpenCode_Bluetooth.bat --com COM3`. Only children started by this supervisor are stopped; a reused server is left running. `--console` runs the supervisor visibly for diagnosis. Logs are in `%LOCALAPPDATA%\SerialOpencode\COM3\` (launcher, server, bridge). Launcher logs rotate by size; child logs rotate on launch. The supervisor retries a disconnected COM port with bounded backoff. Startup has a health-check deadline rather than an endless wait.
 
-The website lives in a GitHub Pages project subpath (`/SerialOpencode/`), so manifest and service-worker references remain relative. `index.html` contains its CSS, JS and UI markup inline; the manifest, service worker and icons are only for PWA installation.
+**Upgrade:** replace the whole checkout, stop the old launcher/bridge, then start this version. `remote.py` must stay beside `opencode_bt_bridge.py`; copying only the old single bridge file is no longer sufficient. Reload the web app for the v3 cache. Do not run an old manually launched bridge alongside the supervisor.
 
-## Security
+## Features
 
-GitHub Pages is public: don't commit passwords, project source code, or session transcripts. The bridge only accesses the OpenCode HTTP server at `127.0.0.1` and your configured local Bluetooth COM port; it opens no internet listener. Bluetooth pairing is **not** a substitute for application-level access control: removing the one-time bridge token means other devices with serial-service access may submit prompts. Follow your organization's device and data-transfer policies.
+- Recent 100 sessions, local search, create/select, rename and confirmed deletion.
+- Acknowledged multiline prompts, Unicode, literal slash-prefixed prompt text, default or explicit agent/model.
+- Stop generation, live session status, incremental reply updates, copy messages and export the loaded transcript.
+- Pending tool permissions (allow once / allow for session / reject) and question replies, including multiple choice and custom answers.
+- Draft retention while switching sessions during the current page lifetime; failed or unacknowledged prompts remain in the editor.
+- Serialized writes, bounded input, partial-write handling, per-session event filtering, and six bounded reconnect attempts after an unexpected disconnect. Prompts are never automatically replayed.
+- Accessible control labels, mobile drawer, reduced-motion support, offline app shell.
 
-## Tests
+No additional authentication is added. Paired devices are trusted. The bridge opens no network listener and accesses OpenCode only on loopback. Optional `OPENCODE_SERVER_PASSWORD` is supported solely for an already password-protected server; no password is required or requested by default. OpenCode's tool approvals remain explicit remote-control actions, not a second login.
+
+## Development
+
+The deployed `index.html` remains self-contained with no runtime dependencies. Maintain readable sources in `web/app.js`, `web/styles.css`, and `web/index.template.html`; generate the artifact rather than editing it directly:
 
 ```sh
+npm ci
+npm run format
+python scripts/build_web.py
 python -m unittest discover -s tests -v
+npx playwright install chromium
+npm test
 ```
 
-Tests use Python's standard library and optionally Node.js for JavaScript syntax verification.
+`CHROMIUM_PATH` can select an existing browser. CI checks the generated artifact, Python/protocol tests, and a real Chromium UI test with a simulated serial transport. Pages deploys only after tests on `main`; pull requests test without deployment. Enable **Settings → Pages → GitHub Actions** for publishing.
 
-## New sessions and the Android sidebar
+## Compatibility and release validation
 
-Creating a new session in the Android app automatically selects it, adds it to the top of the session list, and closes the mobile drawer. Use the × button, backdrop, or Escape key to close the drawer at any time.
+The implemented API contract targets OpenCode 1.x, checked against the 1.2.0 permission/question routes and documented session APIs. A missing permission/question endpoint is reported and disabled; catalog failures retain the default agent/model controls. This is not an OpenCode 2.x API client.
 
-**After upgrading:** refresh or reopen the installed PWA (the service worker cache was bumped to v2) and replace/restart the Windows `bridge/opencode_bt_bridge.py`. The existing COM3 BAT launcher remains compatible. An older running bridge may still report stale sessions even when the web UI is updated.
+Polling is adaptive: 0.5 seconds while busy, at least 3 seconds while idle, with error backoff. It is not SSE streaming. HTTP operations have an 8-second timeout, during which the single bridge loop cannot process another command. Replies are capped at 12,000 characters per message, history at the latest 50 fetched / 20 displayed on request, and rendered chat at 200 rows. Export includes loaded text only. Drafts are in memory and do not survive closing the page. No full terminal, attachments, arbitrary filesystem UI, or full-history pagination is included.
+
+A prompt timeout/disconnect has an **unknown outcome**: inspect history before manually sending again. Request IDs suppress repeated delivery only within the bridge process's latest 128 requests, not across restarts. Protocol details: [docs/protocol.md](docs/protocol.md).
+
+Before a production rollout, validate on the actual Windows/Android pair: hidden startup and duplicate launch, COM removal/reconnect, server restart, stop ownership, long Unicode replies, tool approvals, question replies, install/offline/reload and an interrupted prompt. Automated mock transport tests cannot certify Bluetooth driver behavior or Windows console visibility.
